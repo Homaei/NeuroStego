@@ -1,2 +1,6 @@
 torch
 transformers
+customtkinter
+pyperclip
+packaging
+accelerate

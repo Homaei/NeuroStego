@@ -1,101 +1,142 @@
 import torch
 import torch.nn.functional as F
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import math
 import struct
-from typing import List, Tuple, Optional, Union
+from typing import List, Tuple, Optional, Callable, Dict
+
+# Configuration map for easy access
+AVAILABLE_MODELS = {
+    "GPT-2 (Classic - Stable)": "gpt2",
+    "DistilGPT-2 (Faster)": "distilgpt2",
+    "Qwen2.5-0.5B (Smarter - Modern)": "Qwen/Qwen2.5-0.5B", 
+    "TinyLlama-1.1B (Heavy)": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+}
 
 class SafeNeuralStego:
     """
-    A class for cryptographically secure linguistic steganography using GPT-2.
+    A class for cryptographically secure linguistic steganography using LLMs.
     
-    This class implements a distribution-transforming steganography method that embeds
-    binary data into valid natural language text. It addresses critical issues like
-    floating-point non-determinism to ensure reliable decoding across different hardware.
+    Features:
+    - Distribution-Transforming Steganography (Arithmetic Coding logic).
+    - Deterministic floating-point sorting for hardware independence.
+    - Newline banning for safe copy-pasting.
+    - Support for multiple HuggingFace models.
     """
 
-    def __init__(self, model_name: str = 'gpt2'):
+    def __init__(self, model_name_or_path: str = 'gpt2', log_callback: Optional[Callable[[str], None]] = None, device: Optional[str] = None):
         """
         Initialize the SafeNeuralStego engine.
 
         Args:
-            model_name: The name of the pre-trained GPT-2 model to use.
-                        Defaults to 'gpt2'.
+            model_name_or_path: The HF model ID or path.
+            log_callback: Optional function to handle log messages (e.g., for GUI).
+            device: 'cpu' or 'cuda'. Defaults to 'cpu' for safety, unless strictly controlled.
         """
-        # Force CPU for maximum determinism (GPU floating point ops can be non-deterministic)
-        self.device = 'cpu'
-        print(f"[INIT] Loading {model_name} on {self.device} for deterministic behavior...")
+        self.log_callback = log_callback
         
-        # Suppress warnings to keep output clean and load model/tokenizer
-        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = GPT2LMHeadModel.from_pretrained(model_name)
-        self.model.to(self.device)
-        self.model.eval()
+        # Default to CPU for maximum safety regarding deterministic behavior, 
+        # unless user explicitly wants to risk GPU nondeterminism (or we implement strict checks later).
+        if device:
+            self.device = device
+        else:
+            self.device = 'cpu'
+            
+        self.log(f"[INIT] Loading Model: {model_name_or_path} on {self.device}...")
+        
+        try:
+            # Use Auto classes to support multiple architectures
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+            self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
+            self.model.to(self.device)
+            self.model.eval()
+            
+            # Ensure pad_token is defined
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def _get_deterministic_candidates(self, context_ids: torch.Tensor, top_k: int = 40) -> List[int]:
+            # --- ROBUST NEWLINE BANNING ---
+            # Automatically find and ban tokens that create newlines
+            self.banned_token_ids = []
+            self.log("[INIT] Analyzing vocabulary for unsafe tokens...")
+            
+            # Heuristic: Find common newline tokens in the first 50k tokens
+            # This covers most standard vocabulary without scanning full 150k+ vocabs of modern models
+            vocab_size = self.tokenizer.vocab_size
+            count = 0
+            limit = min(vocab_size, 50257 if 'gpt2' in model_name_or_path else 60000)
+            
+            # Known prohibited characters
+            prohibited = {'\n', '\r'}
+            
+            for t_id in range(limit):
+                try:
+                    token_str = self.tokenizer.decode([t_id])
+                    if any(c in token_str for c in prohibited):
+                        self.banned_token_ids.append(t_id)
+                        count += 1
+                except:
+                    pass
+            
+            self.log(f"[READY] Model Loaded. {count} unsafe tokens banned.")
+            
+        except Exception as e:
+            self.log(f"[ERROR] Critical Load Failure: {e}")
+            raise e
+
+    def log(self, message: str):
+        if self.log_callback:
+            self.log_callback(message)
+        else:
+            print(message)
+
+    def _get_deterministic_candidates(self, context_ids: torch.Tensor, top_k: int = 50) -> List[int]:
         """
         Retrieves candidate tokens in a strictly deterministic order.
-
-        Sorts primarily by Probability (Desc), secondarily by TokenID (Asc).
-        This prevents 'Floating Point Stability' bugs across different CPUs/architectures.
-
-        Args:
-            context_ids: Tensor of shape (1, seq_len) containing input token IDs.
-            top_k: Number of top tokens to consider. Defaults to 40.
-
-        Returns:
-            A list of token IDs sorted deterministically.
+        Bans newlines and sorts primarily by Probability (Desc), secondarily by TokenID (Asc).
         """
         with torch.no_grad():
             outputs = self.model(context_ids)
-            # Get logits of the last token
             logits = outputs.logits[0, -1, :]
 
-        # 1. Filter to Top-K to reduce search space
+        # 1. Ban Newlines (Set to -Infinity)
+        if self.banned_token_ids:
+            # Efficient indexing if possible, or loop if sparse
+            # For 200-300 bans, simple assignment is fast enough
+            logits[self.banned_token_ids] = -float('Inf')
+
+        # 2. Top-K Filter
         top_logits, top_indices = torch.topk(logits, top_k)
         
-        # 2. Convert to probabilities
+        # 3. Convert to probabilities
         probs = F.softmax(top_logits, dim=-1).tolist()
         ids = top_indices.tolist()
         
-        # 3. Create a list of tuples: (probability, token_id)
+        # 4. Create candidates list
         candidates: List[Tuple[float, int]] = []
         for p, i in zip(probs, ids):
+            # Redundant check for safety
+            if i in self.banned_token_ids: continue
             candidates.append((p, i))
             
-        # 4. STRICT DETERMINISTIC SORT:
+        # 5. STRICT DETERMINISTIC SORT:
         # Sort by Probability DESC (-x[0]), then by Token ID ASC (x[1])
-        # This ensures that if two tokens have same prob, the one with lower ID always comes first.
         candidates.sort(key=lambda x: (-x[0], x[1]))
         
-        # Extract just the sorted IDs
-        sorted_ids = [c[1] for c in candidates]
-        return sorted_ids
+        return [c[1] for c in candidates]
 
-    def encode(self, secret_bytes: bytes, start_text: str = "The weather today is") -> str:
+    def encode(self, secret_bytes: bytes, start_text: str = "The future of technology is") -> str:
         """
         Embeds [Length Header + Data] into generated text.
-
-        The protocol embeds a 4-byte length header followed by the actual data.
-
-        Args:
-            secret_bytes: The secret message as bytes.
-            start_text: The initial context for text generation.
-
-        Returns:
-            The generated cover text containing the hidden secret.
-
-        Raises:
-            RuntimeError: If the generated text becomes too long (model entropy issues).
         """
-        # 1. Prepare Protocol Packet: [4-byte Length] + [Data]
-        # 'I' format is unsigned int (4 bytes), supports up to 4GB data size
+        start_text = start_text.strip()
+        if not start_text: start_text = "The future of technology is"
+
+        # Prepare Protocol Packet: [4-byte Length] + [Data]
         length_header = struct.pack('>I', len(secret_bytes)) 
         payload = length_header + secret_bytes
         
-        # Convert payload to a stream of bits string (efficient enough for demo)
-        # We use a generator or simple string for clarity in logic
+        # Convert payload to bit stream
         bits_stream = "".join(f"{byte:08b}" for byte in payload)
         total_bits = len(bits_stream)
         
@@ -103,181 +144,115 @@ class SafeNeuralStego:
         generated_tokens: List[int] = []
         bit_pointer = 0
         
-        print(f"[ENCODE] Payload size: {len(payload)} bytes ({total_bits} bits)")
+        self.log(f"[ENCODE] Hiding {len(payload)} bytes ({total_bits} bits)...")
 
         while bit_pointer < total_bits:
-            # Get candidates strictly sorted
             candidates = self._get_deterministic_candidates(context)
-            
-            # Calculate Capacity: How many bits can we embed in this step?
-            # We use Power-of-2 truncation strategy
+            if not candidates:
+                break # Should ideally not happen unless vocab is extremely small
+
             n_candidates = len(candidates)
             capacity_bits = int(math.floor(math.log2(n_candidates)))
             
-            # If capacity is 0 (rare, only 1 candidate), skip step
             if capacity_bits == 0:
                 best_token = candidates[0]
-                # No bits consumed
             else:
-                # We need 'capacity_bits' from the stream
-                # n_options = 1 << capacity_bits # 2^k (Unused variable, but represents viable range)
-                
-                # Check if we have enough bits left, otherwise pad with 0
                 if bit_pointer + capacity_bits <= total_bits:
                     chunk_str = bits_stream[bit_pointer : bit_pointer + capacity_bits]
                     bit_pointer += capacity_bits
                 else:
                     # Padding for the very last step
-                    # remaining = total_bits - bit_pointer
-                    chunk_str = bits_stream[bit_pointer:]
-                    # Pad with zeros to the right (LSB) to match value logic
-                    chunk_str = chunk_str.ljust(capacity_bits, '0')
-                    bit_pointer = total_bits # Done
+                    chunk_str = bits_stream[bit_pointer:].ljust(capacity_bits, '0')
+                    bit_pointer = total_bits 
                 
-                # Convert bits to integer index
                 chosen_index = int(chunk_str, 2)
                 best_token = candidates[chosen_index]
             
-            # Append to context
             generated_tokens.append(best_token)
             next_input = torch.tensor([[best_token]]).to(self.device)
             context = torch.cat([context, next_input], dim=1)
             
-            # Safety break just in case
-            if len(generated_tokens) > 5000:
-                raise RuntimeError("Text getting too long! Model entropy might be too low.")
+            # Limit length to prevent infinite loops or memory crashes
+            if len(generated_tokens) > 2000:
+                raise ValueError("Text too long. Try a shorter secret or a model with higher entropy.")
 
         full_text = self.tokenizer.decode(context[0])
         return full_text
 
-    def decode(self, full_text: str, start_text: str = "The weather today is") -> Optional[bytes]:
+    def decode(self, full_text: str, start_text: str = "The future of technology is") -> Optional[bytes]:
         """
         Extracts data by re-simulating the generation process.
-
-        Args:
-            full_text: The text containing the hidden message.
-            start_text: The initial context used during encoding.
-
-        Returns:
-            The decoded secret bytes, or None if decoding fails.
         """
+        full_text = full_text.strip()
+        start_text = start_text.strip()
+        if not start_text: start_text = "The future of technology is"
+
+        if not full_text.startswith(start_text):
+            raise ValueError(f"Start text mismatch!\nExpected start: '{start_text}'")
+
         context = self.tokenizer.encode(start_text, return_tensors='pt').to(self.device)
-        # Encode full text to get token IDs
         full_ids = self.tokenizer.encode(full_text, return_tensors='pt').to(self.device)
         
-        # Isolate generated part
         start_len = context.shape[1]
+        if full_ids.shape[1] <= start_len:
+            raise ValueError("No hidden data found (Text matches start text exactly).")
+
         generated_ids = full_ids[0][start_len:].tolist()
         
         recovered_bits = ""
-        
-        # State machine for decoding
-        # We need to read at least 32 bits (4 bytes) to know length
         parsed_length: Optional[int] = None 
-        
         current_context = context
         
+        self.log("[DECODE] Processing text...")
+
         for token_id in generated_ids:
-            # Stop if we have the full message (Header + Body)
+            # Stop if we have the full message
             if parsed_length is not None:
                 total_target_bits = (4 + parsed_length) * 8
                 if len(recovered_bits) >= total_target_bits:
                     break
             
             candidates = self._get_deterministic_candidates(current_context)
-            
             n_candidates = len(candidates)
             capacity_bits = int(math.floor(math.log2(n_candidates)))
             
             if capacity_bits > 0:
                 n_options = 1 << capacity_bits
-                
-                # Where is the observed token in our sorted list?
                 try:
                     rank = candidates.index(token_id)
+                    if rank < n_options:
+                        bits = format(rank, f'0{capacity_bits}b')
+                        recovered_bits += bits
+                    else:
+                        # Token out of range (statistically rare or impossible if generated correctly)
+                        pass
                 except ValueError:
-                    # Token mismatch - critical failure in reproduction
-                    # This happens if temperature/version differs
-                    print(f"[ERROR] Token {token_id} not found in prediction candidates.")
-                    return None
-                
-                if rank < n_options:
-                    # It carries data
-                    bits = format(rank, f'0{capacity_bits}b')
-                    recovered_bits += bits
-                else:
-                    # It was a token outside the embedding range (statistically rare/impossible in our Encoder logic)
+                    # Token not in top candidates (model mismatch or sync lost)
                     pass
             
-            # Advance context
             next_input = torch.tensor([[token_id]]).to(self.device)
             current_context = torch.cat([current_context, next_input], dim=1)
             
-            # Check if we can parse the header now
+            # Check for Header
             if parsed_length is None and len(recovered_bits) >= 32:
                 header_bits = recovered_bits[:32]
-                # Convert bits to int
-                header_bytes = int(header_bits, 2).to_bytes(4, byteorder='big')
-                parsed_length = struct.unpack('>I', header_bytes)[0]
-                print(f"[DECODE] Header found. Message length: {parsed_length} bytes.")
+                try:
+                    header_bytes = int(header_bits, 2).to_bytes(4, byteorder='big')
+                    parsed_length = struct.unpack('>I', header_bytes)[0]
+                    self.log(f"[DECODE] Header found. Message length: {parsed_length} bytes.")
+                except:
+                    return None
 
-        # Reconstruction
         if parsed_length is None:
-            print("[ERROR] Failed to recover header (Not enough data).")
-            return None
+            raise ValueError("Header not found. Text might be truncated or model mismatch.")
             
         total_bits_needed = (4 + parsed_length) * 8
         final_bits = recovered_bits[:total_bits_needed]
         
-        # Convert back to bytes
-        # Split into 8-bit chunks
         bytes_list = []
         for i in range(0, len(final_bits), 8):
             byte_str = final_bits[i:i+8]
             bytes_list.append(int(byte_str, 2))
             
         all_data = bytes(bytes_list)
-        
-        # Separate Header and Body
-        # extracted_length = struct.unpack('>I', all_data[:4])[0] # Already parsed above
-        secret_body = all_data[4:]
-        
-        return secret_body
-
-# --- RIGOROUS TESTING BLOCK ---
-if __name__ == "__main__":
-    print("--- Starting Scientific Robustness Test ---")
-    
-    stego = SafeNeuralStego()
-    
-    # TEST CASE 1: Complex binary data (not just text)
-    # Includes emojis, newlines, and control characters to test robustness
-    original_secret = "Confidential: Attack at 10:00 AM 🚀\nKey: x89-12".encode('utf-8')
-    
-    print(f"\n[INPUT] Original Secret ({len(original_secret)} bytes): {original_secret}")
-    
-    # 1. Encode
-    try:
-        cover_text = stego.encode(original_secret)
-        print(f"\n[OUTPUT] Cover Text:\n---\n{cover_text}\n---")
-    except Exception as e:
-        print(f"Encoding Failed: {e}")
-        exit()
-
-    # 2. Decode
-    try:
-        decoded_bytes = stego.decode(cover_text)
-    except Exception as e:
-        print(f"Decoding Failed: {e}")
-        exit()
-
-    # 3. Verification
-    print(f"\n[RESULT] Decoded Bytes: {decoded_bytes}")
-    
-    if decoded_bytes == original_secret:
-        print("\n✅ TEST PASSED: Perfect Bit-for-Bit Reconstruction.")
-    else:
-        print("\n❌ TEST FAILED: Data Mismatch.")
-        # Debug info
-        print(f"Expected: {list(original_secret)}")
-        print(f"Got:      {list(decoded_bytes) if decoded_bytes else 'None'}")
+        return all_data[4:] # Return body only

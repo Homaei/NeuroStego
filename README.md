@@ -12,7 +12,7 @@
 <br>
 *No metadata leakage. No statistical anomalies. Just natural language.*
 
-[View Demo](#-demo) • [Installation](#-installation) • [The Science](#-mathematical-foundation)
+[View Demo](#-demo) • [Installation](#-installation) • [The Science](#-mathematical-foundation) • [GUI & CLI](#-gui--cli-usage)
 
 </div>
 
@@ -78,7 +78,34 @@ pip install -r requirements.txt
 
 ---
 
-## 📖 Usage Guide (Alice & Bob Scenario)
+## �️ GUI & CLI Usage
+
+We provide three ways to interact with NeuroStego:
+
+### 1. Graphical User Interface (GUI)
+A modern, dark-themed interface built with `CustomTkinter`.
+
+```bash
+python gui.py
+```
+*Features:*
+*   Multi-Model Selector (GPT-2, DistilGPT, etc.)
+*   Auto Copy-to-Clipboard
+*   Status Bar Logging
+
+### 2. Command Line Interface (CLI)
+Interactive mode for servers or headless environments.
+
+```bash
+python cli.py
+```
+
+### 3. Google Colab (Standalone)
+If you want to run this in a notebook (e.g., Google Colab) without cloning the whole repo, use `colab_standalone.py` or copy its content. It auto-installs dependencies.
+
+---
+
+## 📖 Library Usage (Alice & Bob Scenario)
 
 ### Scenario
 Alice wants to send a secret password to Bob. They both have this repository installed.
