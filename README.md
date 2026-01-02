@@ -108,7 +108,7 @@ pip install -r requirements.txt
 
 ---
 
-## �️ GUI & CLI Usage
+## 🖥️ GUI & CLI Usage
 
 We provide three ways to interact with NeuroStego:
 
